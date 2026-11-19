@@ -199,24 +199,19 @@ the speed argument.
 - **Targeting Type:** `refresh_target_mode()` reads the base-game option live from GameData (struct
   `0x834d9d9e`, member `0xc713c7da`, via `read_enum` at `main+0x17BF90`, manager at `main+0x4E842A8`). Values:
   `0x60fc6939` Hold Target, `0x212dc0e7` Toggle Target. It refreshes every 10 scheduler frames.
-- Input (site 3):
-  - **Hold Target:** physical ZL stays native (the game itself holds the target); the shield request only applies
-    while ZL/`LockOn` is active.
-  - **Toggle Target:** physical ZL is consumed, a rising edge latches targeting, and native ZL is synthesised while the
-    latch is on. The shield request only applies while targeting.
-  - **R3** cancels targeting in both modes (unless the target-on-R3 swap is enabled).
-  - While the manual shield is enabled, L is always consumed by the input filter, including during shield-hit
-    reactions (`Guard*`, `Repelled`, `GuardBreak`); otherwise the default L/item function could fire mid-hit. The
-    buttonMapping L slot is disabled too (the assignment is kept); turning the manual shield off restores it.
-- Frame (code hook 0): `manual_shield_on_frame()` updates the ZL gesture/latch once per scheduler frame (repeated HID
-  reads cannot repeat it), caches the player state and AS interface and keeps the native guard flags and AS Bool14 off
-  unless L is held with the target camera active. On guard entry it requests the shield draw only (not the sword).
-- The guard uses the stock locomotion/animation path: the feature only decides whether the guard is allowed. Busy
-  actions (carrying, bow, hookshot, boomerang, horse aim) and a dead/inactive player keep it off. Menus keep their
-  normal L/ZL navigation because the input filter only runs during gameplay.
-- Three extra mid-function sites in `tools/hook_sites.py` (`EXTRA_SITES`, only patched when the feature is built):
-  the AS Bool setter (`main+0x37BA100`) and the two target-guard flag stores (`main+0x972E18`, `main+0x97320C`). Their
-  wrappers are in `manual_shield.S`; the resume addresses are linker symbols in `core/link.ld`.
+- Site 3 receives logical console buttons after host remapping and any enabled `controls.c` options.
+  The game receives ZL for its native Hold/Toggle targeting. In Toggle mode a valid attention lock enables
+  guarding. In Hold mode a held ZL also enables it without a locked actor. A manual R3 cancel in Toggle
+  mode or an enabled automatic retarget can still add a short native ZL press.
+- The manual shield owns logical L while targeting or guarding. An owned press stays consumed until release.
+  Outside that context L keeps its native action. The optional buttonMapping L item slot stays reserved.
+- Scheduler hook 0 consumes a sampled L tap for one guard frame, or keeps guarding while L is held.
+  The frame rechecks targeting, gameplay, carrying and busy actions. It publishes the guard decision to the
+  player flags, guard component and AS Bool14. On guard entry it requests a shield draw except for Young Link
+  with the Hylian Shield, whose existing turtle pose uses the shield on his back.
+- The four optional `EXTRA_SITES` entries in `tools/hook_sites.py` cover the indexed AS bool setter
+  (`main+0x37BA100`), the name-based bool value (`main+0x37BA094`), and the target-guard flag stores
+  (`main+0x972E18` and `main+0x97320C`). Their wrappers are in `manual_shield.S`.
 - The base guard/target behaviour comes from REXCRAFT88's Manual Shield 0.1.7 for the same build; Super Hero Boost
   makes ZL follow the game's Hold/Toggle option and gates the L guard with the target camera.
 

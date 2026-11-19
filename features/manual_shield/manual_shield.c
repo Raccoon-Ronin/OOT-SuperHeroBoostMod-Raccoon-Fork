@@ -1,18 +1,8 @@
-/* manual shield: ZL toggles the lock-on camera, L holds the guard while it is
- * active and R3 cancels targeting.
- *
- * Ported from the behaviour of REXCRAFT88's Manual Shield mod for the same game
- * build. The two halves are:
- *   - manual_shield_on_input: consumes the physical ZL (target toggle) and
- *     synthesises native ZL while our toggle is on; L is only consumed while the
- *     lock-on camera is active, so it keeps its normal game function otherwise;
- *   - manual_shield_on_frame: keeps the native guard state off unless L is held
- *     with the camera active (the game would otherwise raise the shield while
- *     targeting), draws the shield on guard entry and scopes the AS Bool14 setter
- *     through the small assembly wrappers in manual_shield.S.
- *
- * The option is read from ShbConfig.manual_shield; with it off both halves are
- * pass-through and the stock game behaviour is kept.
+/* Manual shield, derived from REXCRAFT88's Manual Shield for this build.
+ * The input hook receives logical console buttons after host remapping and
+ * controls.c. Native ZL runs the game's Hold/Toggle targeting. L requests
+ * guard while targeting. The frame hook publishes the player's guard decision
+ * to the AS bool writers and target-guard flag wrappers in manual_shield.S.
  */
 #include "../../core/dispatch.h"
 #include "../../core/hid.h"
@@ -20,11 +10,8 @@
 
 typedef unsigned char u8;
 
-#define MS_BTN_L   0x40ull
-#define MS_BTN_R3  0x20ull
-#define MS_BTN_ZL  0x100ull
-
 int player_dead(void);
+int hud_is_child(void);
 u64 player_get(void);
 int hud_ingame(void);
 int player_state_is(const char *name);
@@ -55,9 +42,10 @@ u8 g_ms_allowed;         /* this frame's guard decision (read by the setter wrap
 u8 g_ms_held;            /* guard request for this frame (L while targeting) */
 u8 g_ms_carrying;        /* Link is carrying/lifting something */
 u8 g_ms_targeting;       /* toggle mode: targeting latched by a ZL press */
-u8 g_ms_zl_raw;          /* physical ZL in the latest input sample */
-u8 g_ms_l_raw;           /* physical L in the latest input sample */
-u8 g_ms_zl_prev;         /* previous frame's physical ZL, for the toggle edge */
+u8 g_ms_zl_raw;          /* logical ZL before this feature filters input */
+u8 g_ms_l_raw;           /* logical L before this feature filters input */
+u8 g_ms_zl_prev;         /* previous frame's logical ZL, for the toggle edge */
+static u8 guard_press_pending; /* an eligible L edge since the last scheduler frame */
 u8 g_ms_prev_l;          /* previous sampled L (diagnostic) */
 u8 g_ms_l_latch;         /* the current L press belongs to the shield (until L is let go) */
 u8 g_ms_last_allowed;    /* previous frame's decision, for the shield draw */
@@ -192,9 +180,6 @@ static u32 guard_busy(u64 iface, u64 state) {
     return 0;
 }
 
-/* Is Link targeting right now? Toggle Target: our latch (or the native lock-on state, the only signal when the
- * R3 swap leaves the target to the game). Hold Target: only while the target button is held; the game's
- * LockOn* states linger after it is let go and also follow an attack, so they do not count. */
 static u32 ms_target_active(void) {
     /* The game's own lock link (features/controls): valid while an enemy is locked, through attacks and hit
      * reactions too. The LockOn* action names are not used: they also show up near enemies without a target. In
@@ -233,6 +218,7 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
     (void)a2;
     if (site != 3 || !a0) return;
     if (!ms_tracking()) {
+        guard_press_pending = 0;
         g_ms_active = 0;
         g_ms_held = 0;
         g_ms_allowed = 0;
@@ -251,7 +237,7 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
     }
     const u32 ms = g_shbcfg.manual_shield;
     g_ms_active = (u8)(ms != 0);
-    if (!ms) { g_ms_held = 0; g_ms_allowed = 0; g_ms_l_latch = 0; g_ms_last_allowed = 0; }
+    if (!ms) { guard_press_pending = 0; g_ms_held = 0; g_ms_allowed = 0; g_ms_l_latch = 0; g_ms_last_allowed = 0; }
     u32 count = (u32)(unsigned long)a1;
     if (count == 0 || count > 64) count = stock_result;
     if (count == 0 || count > 64) return;
@@ -264,6 +250,7 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
     if (tick == g_ms_last_tick) ++g_ms_stale;
     else { g_ms_last_tick = tick; g_ms_stale = 0; }
     if (g_ms_stale > 8) {
+        guard_press_pending = 0;
         g_ms_zl_raw = 0;
         g_ms_l_raw = 0;
         g_ms_held = 0;
@@ -275,12 +262,13 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
         if (ms && (g_ms_last_allowed || g_ms_targeting || g_ms_l_latch) && ms_gameplay_state()) {
             for (u32 i = 0; i < count; i++) {
                 u64 b = hid_get_buttons(&view, i);
-                hid_set_buttons(&view, i, b & ~MS_BTN_L);
+                hid_set_buttons(&view, i, b & ~BTN_L);
             }
         }
         return;
     }
     if (player_dead()) {   /* death ragdoll / game over: never filter the screen's input */
+        guard_press_pending = 0;
         g_ms_zl_raw = 0;
         g_ms_l_raw = 0;
         g_ms_held = 0;
@@ -295,6 +283,7 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
         return;
     }
     if (!ms_gameplay_state()) {   /* title, loading, pause or event camera: keep the state from firing */
+        guard_press_pending = 0;
         g_ms_zl_raw = 0;
         g_ms_l_raw = 0;
         g_ms_held = 0;
@@ -303,9 +292,10 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
     }
 
     u64 all = hid_merge_buttons(&view);
-    u8 zl = (u8)((all & MS_BTN_ZL) != 0);
-    u8 l = (u8)((all & MS_BTN_L) != 0);
-    u8 r3 = (u8)((all & MS_BTN_R3) != 0);
+    u8 zl = (u8)((all & BTN_ZL) != 0);
+    u8 l = (u8)((all & BTN_L) != 0);
+    u8 r3 = (u8)((all & BTN_R3) != 0);
+    u8 was_l = g_ms_l_raw;
     g_ms_zl_raw = zl;
     g_ms_l_raw = l;
     g_ms_prev_l = l;
@@ -324,13 +314,14 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
 
     /* L belongs to the manual shield only while Link is targeting or the shield is up (including its hit
      * reactions); with no target it reaches the game and keeps its default function. */
-    u32 toggle = g_ms_toggle_mode;
     u32 guard_active = g_ms_held != 0;
-    u32 own_l = ms && (ms_target_active() || guard_active || g_ms_last_allowed || g_ms_l_latch);
+    u32 targeting = ms && ms_target_active();
+    if (!targeting) guard_press_pending = 0;
+    else if (l && !was_l) guard_press_pending = 1;
+    u32 own_l = ms && (targeting || guard_active || g_ms_last_allowed || g_ms_l_latch);
     /* An L press that started as ours stays ours until it is let go (letting go of the target while
      * holding L must not open the item selector halfway through the press). */
     g_ms_l_latch = (u8)(l && own_l);
-    (void)toggle;
     /* The target button always reaches the game as the player presses it (the game's own Hold/Toggle decides);
      * only the presses of ours below are added. (It used to be re-created from a latch fed by the LockOn*
      * action names, which also show up near enemies: the game then locked on by itself.) */
@@ -339,11 +330,11 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
         /* While targeting or guarding L is ours, including during shield-hit reactions
          * (Guard/Repelled/GuardBreak): otherwise the default L (item/selector) fires for a frame in the
          * middle of the hit. */
-        if (own_l) b &= ~MS_BTN_L;
-        if (g_ms_r3_own) b &= ~MS_BTN_R3;
+        if (own_l) b &= ~BTN_L;
+        if (g_ms_r3_own) b &= ~BTN_R3;
         /* The target died: press target again so the game picks the next one. The game sees ZL (controls.c
          * already swapped R3 into it), and a short hold is one press for the toggle. Also the R3 cancel. */
-        if (g_ms_retarget || g_ms_cancel) b |= MS_BTN_ZL;
+        if (g_ms_retarget || g_ms_cancel) b |= BTN_ZL;
         hid_set_buttons(&view, i, b);
     }
     if (g_ms_cancel) g_ms_cancel--;
@@ -351,6 +342,8 @@ void manual_shield_on_input(u32 site, void *a0, void *a1, void *a2, u32 stock_re
 }
 
 void manual_shield_on_frame(void *scheduler) {
+    u8 pressed = guard_press_pending;
+    guard_press_pending = 0;
     g_ms_iface = 0;
     g_ms_equipment = 0;
     g_ms_carrying = 0;
@@ -470,12 +463,13 @@ void manual_shield_on_frame(void *scheduler) {
     u64 actor = rd(state, 0x18);
     if (!actor) return;
     g_ms_carrying = (u8)player_carrying(actor);
-    g_ms_held = (u8)(!g_ms_carrying && g_ms_l_raw && ms_target_active());
+    g_ms_held = (u8)(!g_ms_carrying && (g_ms_l_raw || pressed) && ms_target_active());
+    u64 iface = current_guard_interface(actor);
+    g_ms_iface = iface;
+    /* AS can be available before the guard component. Keep the setter scoped
+     * to the current player even on a frame which cannot grant a guard. */
     u64 component = get_guard_component((void *)actor);
     if (!component) return;
-
-    u64 iface = current_guard_interface(actor);
-    if (iface) g_ms_iface = iface;
     u64 table = rd(actor, 0x270);
     u64 equipment = table ? rd(table, 0x200) : 0;
     if (iface && equipment) g_ms_equipment = equipment;
@@ -504,7 +498,10 @@ void manual_shield_on_frame(void *scheduler) {
 
     /* Draw only the shield: targeting must not make the hook draw the sword. */
     if (allowed && !g_ms_last_allowed) {
-        if (equipment && (!iface || as_int((void *)iface, 1) != 2)) {
+        /* Player AS Int2 is ShieldType. Its value 2 selects the Hylian
+         * animations. The child turtle pose uses the shield on Link's back. */
+        if (equipment && as_int((void *)iface, 1) != 2 &&
+            !(hud_is_child() == 1 && as_int((void *)iface, 2) == 2)) {
             native_draw_equipment((void *)equipment, 4);
             g_ms_dbg[7]++;
         }

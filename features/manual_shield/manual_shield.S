@@ -1,6 +1,6 @@
 /* Assembly side of the manual shield feature.
  *
- * Three stock instructions are replaced by branches to these wrappers. They
+ * Stock instructions are replaced by branches to these wrappers. They
  * keep the original register contract and jump back to the stock continuation
  * (or to the stock function body), so the game's own guard/target logic stays
  * in charge of locomotion and animation.
@@ -38,6 +38,29 @@ hook_guard_setter:
 2:
     b GUARD_SETTER_EARLY
 .size hook_guard_setter, . - hook_guard_setter
+
+/* The name-based setter resolves the index in w8 and writes the bool inline,
+ * bypassing hook_guard_setter. At this point x0 is the AS interface and w9
+ * is the destination of the displaced instruction. Preserve w2 and NZCV. */
+.global hook_guard_named_value
+.type hook_guard_named_value, %function
+hook_guard_named_value:
+    eor  w9, w8, #14
+    cbnz w9, 1f
+    adrp x9, g_ms_active
+    ldrb w9, [x9, :lo12:g_ms_active]
+    cbz  w9, 1f
+    adrp x9, g_ms_iface
+    ldr  x9, [x9, :lo12:g_ms_iface]
+    eor  x9, x9, x0
+    cbnz x9, 1f
+    adrp x9, g_ms_allowed
+    ldrb w9, [x9, :lo12:g_ms_allowed]
+    b    GUARD_NAMED_RESUME
+1:
+    and  w9, w2, #1
+    b    GUARD_NAMED_RESUME
+.size hook_guard_named_value, . - hook_guard_named_value
 
 /* main+0x972E18: `orr w8,w8,w9` writing the player's target/guard flags.
  * The stock path sets the 0x80000 target-guard bit; when the guard is not

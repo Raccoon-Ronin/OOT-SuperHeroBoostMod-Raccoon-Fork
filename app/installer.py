@@ -99,7 +99,7 @@ class Settings:
     bm_simple: bool = False          # simple layout: only the assignable buttons (no A / X / Y)
     bm_l_mode: str = "assign"        # one of L_MODES
     stamina_bar: bool = False        # stamina UI: segmented horizontal bar instead of the ring
-    manual_shield: bool = False      # ZL holds the guard, L toggles targeting, R3 cancels
+    manual_shield: bool = False      # logical L guards while targeting with logical ZL
     target_r3: bool = False          # swap ZL and R3 (target on R3; Toggle targeting recommended)
     sprint_l3: bool = False          # L3 (left stick click) presses A while held (sprint)
     auto_target: bool = False        # when the target dies, press target again for the next enemy

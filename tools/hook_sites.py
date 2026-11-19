@@ -73,6 +73,7 @@ STORE_SITES = (
 # patched when `feature` is part of the build, so a build without the feature
 # keeps the stock instructions. (site, wrapper symbol, expected stock word, feature)
 EXTRA_SITES = (
+    (0x37BA094, "hook_guard_named_value", 0x12000049, "manual_shield"),  # and w9,w2,#1 (name-based AS bool write)
     (0x37BA100, "hook_guard_setter", 0x37F801C1, "manual_shield"),  # tbnz w1,#31 in the AS bool setter
     (0x972E18, "hook_guard_flags", 0x2A090108, "manual_shield"),    # orr w8,w8,w9 (target guard flags)
     (0x97320C, "hook_guard_update", 0x320D0129, "manual_shield"),   # orr w9,w9,#0x80000 (target guard update)

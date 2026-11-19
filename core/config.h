@@ -50,7 +50,7 @@ typedef struct {
     signed short hud_ioff;          /* rupee icon x offset */
     signed short hud_tx;            /* text x offset */
     signed short hud_ioff2;         /* clock/collectible icon x offset (wide: same as hud_ioff) */
-    unsigned char manual_shield;    /* ZL holds the guard, L toggles targeting, R3 cancels it */
+    unsigned char manual_shield;    /* logical L guards while targeting with logical ZL */
     unsigned char target_r3;        /* swap ZL and R3: target with R3 (recommended with Toggle targeting) */
     unsigned char sprint_l3;        /* L3 (left stick click) presses A while held, so Link sprints */
     unsigned char auto_target;      /* when the target dies, press target again to lock on to the next enemy */
