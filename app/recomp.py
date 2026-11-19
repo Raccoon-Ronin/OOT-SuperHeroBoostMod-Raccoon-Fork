@@ -853,6 +853,83 @@ def write_image(game: Path, s: I.Settings) -> bool:
     return True
 
 
+def _config_span(data: bytes) -> tuple[int, int]:
+    """Strict bounds for recovery; do not guess a damaged or future config layout."""
+    at = data.find(CONFIG_MAGIC)
+    if at < 0 or data.count(CONFIG_MAGIC) != 1 or at + 16 > len(data):
+        raise ValueError("missing or ambiguous config")
+    version, size = struct.unpack_from("<II", data, at + 8)
+    if version != 1 or size not in (72, 76, 80) or at + size > len(data):
+        raise ValueError("unsupported config")
+    return at, size
+
+
+def _normalized_config(data: bytes) -> bytes:
+    at, size = _config_span(data)
+    # Reset only fields the installer writes. Header, alignment padding and all
+    # non-config bytes still have to match the bundled release exactly.
+    return data[:at] + I.patch_config(data[at:at + size], I.Settings()) + data[at + size:]
+
+
+def _file_sha256(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _can_recover_metadata(game: Path, reference: bytes, image: bytes) -> bool:
+    """Recognize a pre-fix install, without changing it or trusting magic alone.
+
+    Use the image's unique config to locate the module, then compare every
+    file-backed NSO segment at its memory offset. Relocated/unknown layouts fail
+    closed. This checks guest code, not the native executable's provenance.
+    """
+    try:
+        installed = (exefs_of(game) / "subsdk9").read_bytes()
+        if _normalized_config(installed) != _normalized_config(reference):
+            return False
+        cfg, size = _config_span(reference)
+        image_cfg, image_size = _config_span(image)
+        if size != image_size or reference[:4] != b"NSO0" or len(reference) < 0x100:
+            return False
+        if struct.unpack_from("<I", reference, 0x0C)[0] & 7:  # compressed segments
+            return False
+        segments = [struct.unpack_from("<III", reference, off) for off in (0x10, 0x20, 0x30)]
+        data_file, data_mem, data_size = segments[2]
+        if not data_file <= cfg < cfg + size <= data_file + data_size:
+            return False
+        base = image_cfg - (data_mem + cfg - data_file)
+        if base < 0:
+            return False
+        for index, (file_at, mem_at, length) in enumerate(segments):
+            if length == 0 or file_at < 0x100 or file_at + length > len(reference):
+                return False
+            start = base + mem_at
+            if start + length > len(image):
+                return False
+            expected = reference[file_at:file_at + length]
+            actual = image[start:start + length]
+            if index == 2:
+                expected, actual = _normalized_config(expected), _normalized_config(actual)
+            if actual != expected:
+                return False
+        if not is_built(game):
+            return False
+        exe = exe_of(game)
+        if exe is None:
+            return False
+        backup = game / BACKUP / "files" / exe.relative_to(game)
+        if not backup.is_file():
+            backup = game / BACKUP / exe.name  # legacy flat snapshot
+        # Timestamps and sizes alone can mistake a touched/copied stock exe for
+        # a rebuild. Require a preserved original and different contents too.
+        return backup.is_file() and _file_sha256(exe) != _file_sha256(backup)
+    except (OSError, ValueError, struct.error, I.InstallError):
+        return False
+
+
 def install_romfs(game: Path, s: I.Settings) -> tuple[int, list]:
     """Copy the selected romfs files into the recompiler's mod folder."""
     pay = payload_dir()
@@ -909,11 +986,12 @@ def install_romfs(game: Path, s: I.Settings) -> tuple[int, list]:
     later = I.later_table_mods(game / "mods", MOD_NAME)
     if later:
         notes.append(("table_later", ", ".join(later)))
-    if copied:
-        variant = payload_variant(game)
-        sha = hashlib.sha256((payload_dir() / variant / "subsdk9").read_bytes()).hexdigest()
-        (target.parent / ".super-hero-boost").write_text(
-            json.dumps({"variant": "recomp", "module": variant, "module_sha": sha, **s.to_dict()}, indent=1))
+    variant = payload_variant(game)
+    sha = hashlib.sha256((payload_dir() / variant / "subsdk9").read_bytes()).hexdigest()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    (target.parent / I.MARKER).write_text(
+        json.dumps({"variant": "recomp", "module": variant, "module_sha": sha, **s.to_dict()}, indent=1),
+        encoding="utf-8")
     return copied, notes
 
 
@@ -1180,15 +1258,32 @@ def apply_settings(game_path, s: I.Settings) -> Result:
         raise I.InstallError("recomp_running", str(game))
     if not (exefs_of(game) / "subsdk9").exists():
         raise I.InstallError("recomp_needs_build", str(game))
-    src = payload_dir() / payload_variant(game) / "subsdk9"
+    variant = payload_variant(game)
+    src = payload_dir() / variant / "subsdk9"
+    marker = game / "mods" / MOD_NAME / I.MARKER
+    missing_metadata = False
     try:
-        cfg = json.loads((game / "mods" / MOD_NAME / ".super-hero-boost").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        cfg = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         cfg = {}
-    current = hashlib.sha256(src.read_bytes()).hexdigest() if src.exists() else None
-    if src.exists() and (cfg.get("module") != payload_variant(game) or cfg.get("module_sha") != current):
+        missing_metadata = True
+    except (OSError, ValueError):
+        raise I.InstallError("recomp_needs_build", str(game))
+    try:
+        reference = src.read_bytes()
+        image = (game / "image.bin").read_bytes()
+        _config_span(image)  # reject before backups, module writes or romfs changes
+    except (OSError, ValueError):
+        raise I.InstallError("recomp_needs_build", str(game))
+    current = hashlib.sha256(reference).hexdigest()
+    if missing_metadata:
+        if not _can_recover_metadata(game, reference, image):
+            raise I.InstallError("recomp_needs_build", str(game))
+    elif not isinstance(cfg, dict) or cfg.get("module") != variant or cfg.get("module_sha") != current:
         raise I.InstallError("recomp_needs_build", str(game))
     bid = main_build_id(exefs_of(game) / "main")
+    if missing_metadata and (len(bid) != 64 or not bid.startswith(I.BUILD_ID.lower())):
+        raise I.InstallError("recomp_bad_build", bid[:8])
     if bid and not bid.startswith(MODULE_BUILD):
         raise I.InstallError("recomp_bad_build", bid[:8])
     backup_once(game)
